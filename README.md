@@ -41,7 +41,7 @@ When `callback_url` is set, the workflow POSTs this JSON to it when the run ends
 }
 ```
 
-The callback address is private: the workflow reads it from the run's event file and masks it, so it never appears in the public log. When the optional `SEED_WEBHOOK_SECRET` organization secret exists, the request also carries `X-SEED-Signature: sha256=<hex>`, an HMAC-SHA256 with that secret over `request_id`, `repository`, `status`, `commit`, `run_url` and `summary` joined by new lines (not the raw body, so SEED can check it from the parsed JSON).
+The callback address is private. GitHub prints the inputs a caller passes to a shared workflow in the public log, so a site's caller must not pass `callback_url` along (the template's caller doesn't); the shared workflow reads it from the run's own `workflow_dispatch` inputs in the event file and masks it. SEED only sends its address to sites whose caller follows this, and it treats each post as a nudge to read the result from GitHub, so a leaked address can't change what SEED records. When the optional `SEED_WEBHOOK_SECRET` organization secret exists, the request also carries `X-SEED-Signature: sha256=<hex>`, an HMAC-SHA256 with that secret over `request_id`, `repository`, `status`, `commit`, `run_url` and `summary` joined by new lines (not the raw body, so SEED can check it from the parsed JSON).
 
 SEED can also read every result from GitHub without the callback: the commit message carries the summary and a `SEED-Request:` line, and the run carries the summary as a note titled "Claude's summary".
 

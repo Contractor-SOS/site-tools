@@ -31,7 +31,7 @@ on:
         type: string
         default: ""
       callback_url:
-        description: SEED webhook that receives the result (optional)
+        description: Don't use. GitHub prints these inputs in the public log, so SEED's private address is read from the run's own workflow_dispatch inputs instead
         type: string
         default: ""
       max_turns:
@@ -281,7 +281,7 @@ jobs:
           PY
 
       - name: Report back to SEED
-        if: always() && inputs.callback_url != ''
+        if: always()
         env:
           STATUS: ${{ steps.finish.outputs.status }}
           COMMIT: ${{ steps.finish.outputs.commit }}
