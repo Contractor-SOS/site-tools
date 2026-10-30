@@ -45,7 +45,8 @@ on:
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         description: Long-lived token from `claude setup-token`; runs use that Claude subscription
-        required: true
+        # Checked in the first step instead, so a missing secret fails with a readable message
+        required: false
       SEED_WEBHOOK_SECRET:
         description: Shared secret SEED uses to check that a result really came from this workflow (optional)
         required: false
@@ -70,6 +71,16 @@ jobs:
     env:
       REQUEST_ID: ${{ inputs.request_id }}
     steps:
+      - name: Check the setup
+        env:
+          TOKEN_SET: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+        run: |
+          if [ "$TOKEN_SET" != "true" ]; then
+            echo "::error::This repo can't see the CLAUDE_CODE_OAUTH_TOKEN secret. In the organization's Settings, open Secrets and variables, then Actions, edit CLAUDE_CODE_OAUTH_TOKEN, and set Repository access to Public repositories."
+            exit 1
+          fi
+          echo "Token secret is available."
+
       - name: Check out the preview branch
         uses: actions/checkout@v6
         with:
