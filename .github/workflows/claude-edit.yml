@@ -230,7 +230,15 @@ jobs:
           git add -A site
           status=no_changes
           if ! git diff --cached --quiet; then
-            title=$(head -n 1 "$work/summary.md" | cut -c1-72)
+            title=$(python3 - "$work/summary.md" <<'PY'
+          import re, sys
+          text = " ".join(open(sys.argv[1], encoding="utf-8").read().split())
+          first = re.split(r"(?<=[.!?])\s", text, maxsplit=1)[0]
+          if len(first) > 72:
+              first = first[:71].rsplit(" ", 1)[0].rstrip(",;:(") + "…"
+          print(first)
+          PY
+            )
             { printf '%s\n\n' "$title"; cat "$work/summary.md"; printf '\nSEED-Request: %s\n' "$REQUEST_ID"; } > "$work/commit-message.txt"
             git commit --quiet --file "$work/commit-message.txt"
             status=changed
