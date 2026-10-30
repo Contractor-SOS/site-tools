@@ -11,7 +11,7 @@ Shared GitHub Actions workflows for every website CSOS hosts. Each site repo car
 
 - This repo and every site repo are **public**, so they can share these workflows and read organization secrets on GitHub Free. Never commit passwords, API keys or tokens. Run logs are public too.
 - Organization secret `CLAUDE_CODE_OAUTH_TOKEN` (**Settings → Secrets and variables → Actions**, repository access: all repositories). It comes from running `claude setup-token`, uses that person's Claude subscription, and lasts a year.
-- Optional organization secret `SEED_WEBHOOK_SECRET`: when set, each result sent to SEED carries an `X-SEED-Signature: sha256=<HMAC of the body>` header that SEED checks.
+- Optional organization secret `SEED_WEBHOOK_SECRET`: when set, each result sent to SEED carries an `X-SEED-Signature` header (see below). Add the same value to SEED as the Zite secret `ZITE_SEED_WEBHOOK_SECRET` and SEED rejects results without a valid signature.
 - The Claude GitHub App is installed on the organization for all repositories.
 
 ## Setup for each site repo
@@ -24,21 +24,26 @@ Site repo → **Actions → Claude edit → Run workflow**. Type the change in "
 
 ## What SEED sends and gets back
 
-SEED starts the site repo's `Claude edit` workflow with these inputs: `request_id`, `request`, `screenshots`, `attachments`, `history`, `callback_url`, `max_turns` and `model`. When `callback_url` is set, the workflow POSTs this JSON to it when the run ends:
+SEED starts the site repo's `Claude edit` workflow with these inputs: `request_id`, `request`, `screenshots`, `attachments`, `history`, `callback_url`, `max_turns` and `model`. Screenshot and attachment URLs are separated by spaces, commas or new lines; an attachment URL can end in `#name=<file name>` (URL-encoded) to name the file it becomes.
+
+When `callback_url` is set, the workflow POSTs this JSON to it when the run ends:
 
 ```json
 {
   "request_id": "REQ-123",
   "repository": "Contractor-SOS/cce-website",
-  "status": "changed | no_changes | failed",
+  "status": "changed | no_changes | failed | cancelled",
   "summary": "Claude's plain-English summary",
   "commit": "sha of preview after the run",
+  "run_id": "41000000000",
   "run_url": "https://github.com/.../actions/runs/...",
   "branch": "preview"
 }
 ```
 
-The commit message also carries the summary and a `SEED-Request:` line, so SEED can read results from GitHub if a callback is missed.
+The callback address is private: the workflow reads it from the run's event file and masks it, so it never appears in the public log. When the optional `SEED_WEBHOOK_SECRET` organization secret exists, the request also carries `X-SEED-Signature: sha256=<hex>`, an HMAC-SHA256 with that secret over `request_id`, `repository`, `status`, `commit`, `run_url` and `summary` joined by new lines (not the raw body, so SEED can check it from the parsed JSON).
+
+SEED can also read every result from GitHub without the callback: the commit message carries the summary and a `SEED-Request:` line, and the run carries the summary as a note titled "Claude's summary".
 
 ## Guard rails
 
