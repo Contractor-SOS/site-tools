@@ -1,0 +1,113 @@
+# Shared workflow that archives an old website before a move: full-page desktop
+# and phone screenshots of every listed page, plus copies of listed files such
+# as logos. The private site-archive repo calls it, one folder per site, so
+# screenshots of old sites (which may show licensed stock photos) stay private.
+name: Archive a site (shared)
+
+on:
+  workflow_call:
+    inputs:
+      folder:
+        description: The site's folder in the calling repo. Reads <folder>/archive-pages.txt and <folder>/archive-files.txt and saves to <folder>/old-site/
+        type: string
+        required: true
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      PAGES_FILE: ${{ inputs.folder }}/archive-pages.txt
+      FILES_FILE: ${{ inputs.folder }}/archive-files.txt
+      OUT_DIR: ${{ inputs.folder }}/old-site
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install a headless browser
+        if: hashFiles(format('{0}/archive-pages.txt', inputs.folder)) != ''
+        run: |
+          mkdir -p "$RUNNER_TEMP/pw" && cd "$RUNNER_TEMP/pw"
+          npm init -y > /dev/null
+          npm install --silent playwright@1
+          npx playwright install --with-deps chromium
+
+      - name: Screenshot every page (desktop and phone)
+        if: hashFiles(format('{0}/archive-pages.txt', inputs.folder)) != ''
+        run: |
+          cat > "$RUNNER_TEMP/pw/shoot.mjs" <<'JS'
+          import { chromium } from 'playwright';
+          import fs from 'node:fs';
+          import path from 'node:path';
+
+          const repo = process.env.GITHUB_WORKSPACE;
+          const urls = fs.readFileSync(path.join(repo, process.env.PAGES_FILE), 'utf8')
+            .split('\n').map((line) => line.trim()).filter((line) => line && !line.startsWith('#'));
+          const out = path.join(repo, process.env.OUT_DIR, 'screenshots');
+          fs.mkdirSync(out, { recursive: true });
+
+          const views = [
+            { name: 'desktop', options: { viewport: { width: 1440, height: 900 } } },
+            { name: 'phone', options: { viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true } },
+          ];
+
+          const browser = await chromium.launch();
+          for (const view of views) {
+            const context = await browser.newContext(view.options);
+            const page = await context.newPage();
+            for (const url of urls) {
+              const slug = (new URL(url).pathname.replace(/^\/+|\/+$/g, '') || 'home').replace(/[^a-z0-9-]+/gi, '-');
+              try {
+                await page.goto(url, { waitUntil: 'load', timeout: 60000 });
+                const height = await page.evaluate(() => document.body.scrollHeight);
+                for (let y = 0; y < height; y += 600) {
+                  await page.evaluate((top) => window.scrollTo(0, top), y);
+                  await page.waitForTimeout(200);
+                }
+                await page.evaluate(() => window.scrollTo(0, 0));
+                await page.waitForTimeout(4000);
+                await page.screenshot({ path: path.join(out, `${slug}-${view.name}.jpg`), fullPage: true, type: 'jpeg', quality: 80 });
+                console.log(`saved ${slug}-${view.name}.jpg`);
+              } catch (error) {
+                console.log(`::warning::${url} (${view.name}): ${error.message}`);
+              }
+            }
+            await context.close();
+          }
+          await browser.close();
+          JS
+          cd "$RUNNER_TEMP/pw" && node shoot.mjs
+
+      - name: Copy listed files
+        if: hashFiles(format('{0}/archive-files.txt', inputs.folder)) != ''
+        run: |
+          set -uo pipefail
+          grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$FILES_FILE" | while read -r url dest; do
+            if [ -z "${dest:-}" ]; then
+              name=$(basename "${url%%\?*}" | python3 -c 'import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))' | tr 'A-Z' 'a-z' | tr -c 'a-z0-9._-' '-' | sed 's/--*/-/g')
+              dest="$OUT_DIR/files/$name"
+            fi
+            case "$dest" in
+              /*|*..*|.github/*) echo "::warning::Skipping unsafe destination $dest"; continue ;;
+            esac
+            mkdir -p "$(dirname "$dest")"
+            if curl -fsSL --max-time 120 -o "$dest" "$url"; then
+              echo "saved $dest"
+            else
+              echo "::warning::Couldn't download $url"
+            fi
+          done
+
+      - name: Commit the archive
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing new to archive"
+            exit 0
+          fi
+          git commit --quiet -m "Archive the old site for $OUT_DIR: screenshots and files"
+          git pull --quiet --rebase origin "${GITHUB_REF_NAME}"
+          git push --quiet origin "HEAD:${GITHUB_REF_NAME}"

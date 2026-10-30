@@ -1,0 +1,277 @@
+# Shared Claude edit workflow for every CSOS site repo.
+#
+# Each site repo has a small caller, .github/workflows/claude-edit.yml, which
+# SEED starts with workflow_dispatch (or someone starts from the Actions tab).
+# This workflow checks out the site's preview branch, has Claude Code edit the
+# files in site/, commits the result to preview and reports back to SEED.
+# Cloudflare Pages then rebuilds preview.<domain> on its own.
+name: Claude edit (shared)
+
+on:
+  workflow_call:
+    inputs:
+      request_id:
+        description: SEED change request ID, or any label for a manual run
+        type: string
+        required: true
+      request:
+        description: What to change, in plain English
+        type: string
+        required: true
+      screenshots:
+        description: Reference images such as marked-up screenshots (URLs separated by spaces, commas or new lines)
+        type: string
+        default: ""
+      attachments:
+        description: Files to add to the site, such as photos (URLs separated by spaces, commas or new lines)
+        type: string
+        default: ""
+      history:
+        description: Earlier requests and Claude's replies for this site, oldest first
+        type: string
+        default: ""
+      callback_url:
+        description: SEED webhook that receives the result (optional)
+        type: string
+        default: ""
+      max_turns:
+        description: Most steps Claude may take in one run
+        type: number
+        default: 30
+      model:
+        description: Claude model to use (blank uses Claude Code's default)
+        type: string
+        default: ""
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: Long-lived token from `claude setup-token`; runs use that Claude subscription
+        required: true
+      SEED_WEBHOOK_SECRET:
+        description: Shared secret SEED uses to check that a result really came from this workflow (optional)
+        required: false
+    outputs:
+      status:
+        description: changed, no_changes or failed
+        value: ${{ jobs.edit.outputs.status }}
+      commit:
+        description: The preview commit after this run
+        value: ${{ jobs.edit.outputs.commit }}
+
+jobs:
+  edit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write
+      id-token: write
+    outputs:
+      status: ${{ steps.finish.outputs.status }}
+      commit: ${{ steps.finish.outputs.commit }}
+    env:
+      REQUEST_ID: ${{ inputs.request_id }}
+    steps:
+      - name: Check out the preview branch
+        uses: actions/checkout@v6
+        with:
+          ref: preview
+          fetch-depth: 0
+
+      - name: Bring preview up to date with the live site
+        run: |
+          git config user.name "Claude (SEED)"
+          git config user.email "noreply@anthropic.com"
+          git fetch --quiet origin main
+          if git merge-base --is-ancestor origin/main HEAD; then
+            echo "preview already includes everything on main"
+          else
+            git merge --no-edit -m "Bring preview up to date with the live site" origin/main
+          fi
+
+      - name: Save the request and download images
+        env:
+          REQUEST: ${{ inputs.request }}
+          HISTORY: ${{ inputs.history }}
+          SCREENSHOTS: ${{ inputs.screenshots }}
+          ATTACHMENTS: ${{ inputs.attachments }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/seed"
+          mkdir -p "$work/screenshots"
+          printf '%s\n' "$REQUEST" > "$work/request.md"
+          printf '%s\n' "${HISTORY:-(none)}" > "$work/history.md"
+          safe_id=$(printf '%s' "$REQUEST_ID" | tr -c 'A-Za-z0-9_-' '-' | cut -c1-40)
+          echo "SAFE_ID=$safe_id" >> "$GITHUB_ENV"
+
+          ext_for() {
+            case "$(file --brief --mime-type "$1")" in
+              image/png) echo png ;;
+              image/jpeg) echo jpg ;;
+              image/webp) echo webp ;;
+              image/gif) echo gif ;;
+              image/svg+xml) echo svg ;;
+              application/pdf) echo pdf ;;
+              *) echo "" ;;
+            esac
+          }
+
+          n=0
+          for url in $(printf '%s' "$SCREENSHOTS" | tr ',\n\r' '   '); do
+            n=$((n + 1))
+            tmp="$work/screenshots/download-$n"
+            if curl -fsSL --max-time 60 --max-filesize 26214400 -o "$tmp" "$url"; then
+              ext=$(ext_for "$tmp")
+              case "$ext" in
+                png|jpg|webp|gif) mv "$tmp" "$work/screenshots/screenshot-$n.$ext" ;;
+                *) rm -f "$tmp"; echo "::warning::Screenshot $n isn't an image, so it was skipped" ;;
+              esac
+            else
+              echo "::warning::Couldn't download screenshot $n"
+            fi
+          done
+
+          n=0
+          for url in $(printf '%s' "$ATTACHMENTS" | tr ',\n\r' '   '); do
+            n=$((n + 1))
+            dest_dir="site/assets/uploads/$safe_id"
+            mkdir -p "$dest_dir"
+            name=$(basename "${url%%\?*}" | python3 -c 'import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))' | tr 'A-Z' 'a-z' | tr -c 'a-z0-9._-' '-' | sed 's/--*/-/g; s/^-//' | cut -c1-80)
+            base="${name%.*}"
+            [ -n "$base" ] || base="file-$n"
+            tmp="$RUNNER_TEMP/attachment-$n"
+            if curl -fsSL --max-time 120 --max-filesize 26214400 -o "$tmp" "$url"; then
+              ext=$(ext_for "$tmp")
+              if [ -z "$ext" ]; then
+                rm -f "$tmp"
+                echo "::warning::Attachment $n isn't an image or PDF, so it was skipped"
+                continue
+              fi
+              mv "$tmp" "$dest_dir/$base.$ext"
+            else
+              echo "::warning::Couldn't download attachment $n"
+            fi
+          done
+          ls -la "$work/screenshots" 2>/dev/null || true
+          ls -la "site/assets/uploads/$safe_id" 2>/dev/null || true
+
+      - name: Write the instructions for this run
+        run: |
+          work="$RUNNER_TEMP/seed"
+          uploads="site/assets/uploads/$SAFE_ID"
+          {
+            echo "You are editing this company's website. Follow CLAUDE.md in the repository root."
+            echo
+            echo "The change request is in $work/request.md."
+            echo "Earlier requests and your replies for this site, oldest first, are in $work/history.md. Use them to understand follow-ups such as \"make it bigger\"."
+            if ls "$work"/screenshots/* > /dev/null 2>&1; then
+              echo "Reference images are in $work/screenshots/. Open each one with the Read tool: marks drawn on them show what to change. They are for reference only, so don't copy them into the site."
+            fi
+            if [ -d "$uploads" ]; then
+              echo "Files to add to the site are in $uploads/. Use them where the request says. Move or rename them as needed, and delete any you don't use."
+            fi
+            echo
+            echo "Rules for this run:"
+            echo "- Change only files inside site/. Never touch .github/, CLAUDE.md, README.md or capture/."
+            echo "- Don't commit, push or create branches. The workflow commits your changes to the preview branch."
+            echo "- Keep every existing URL working. If you remove or rename a page, add a 301 line to site/_redirects."
+            echo "- If the request is unclear, or needs something outside site/ (DNS, another system's form settings), change nothing and explain why in the summary."
+            echo
+            echo "When you finish, write a short plain-English summary for the site owner to $work/summary.md: what you changed and on which pages, anything you couldn't do, and anything they should check. Two to six sentences, no code."
+          } > "$work/prompt.md"
+          cat "$work/prompt.md"
+
+      - name: Run Claude
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: Read ${{ runner.temp }}/seed/prompt.md and follow the instructions in it.
+          claude_args: >-
+            --max-turns ${{ inputs.max_turns }}
+            --add-dir ${{ runner.temp }}/seed
+            --allowedTools Read,Edit,Write,Glob,Grep
+            --disallowedTools Bash,WebFetch,WebSearch
+            ${{ inputs.model != '' && format('--model {0}', inputs.model) || '' }}
+
+      - name: Keep changes inside site/
+        run: |
+          set -euo pipefail
+          changed=$( { git diff --name-only; git ls-files --others --exclude-standard; } | sort -u )
+          outside=$(printf '%s\n' "$changed" | grep -v -e '^site/' -e '^$' || true)
+          if [ -n "$outside" ]; then
+            echo "::warning::Undoing changes outside site/:"
+            printf '%s\n' "$outside"
+            printf '%s\n' "$outside" | while IFS= read -r path; do
+              if git ls-files --error-unmatch -- "$path" > /dev/null 2>&1; then
+                git checkout HEAD -- "$path"
+              else
+                rm -rf -- "$path"
+              fi
+            done
+            printf '\n(Changes outside the website files were undone.)\n' >> "$RUNNER_TEMP/seed/summary.md"
+          fi
+
+      - name: Commit to preview
+        id: finish
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/seed"
+          [ -s "$work/summary.md" ] || echo "Claude finished without writing a summary." > "$work/summary.md"
+          git add -A site
+          status=no_changes
+          if ! git diff --cached --quiet; then
+            title=$(head -n 1 "$work/summary.md" | cut -c1-72)
+            { printf '%s\n\n' "$title"; cat "$work/summary.md"; printf '\nSEED-Request: %s\n' "$REQUEST_ID"; } > "$work/commit-message.txt"
+            git commit --quiet --file "$work/commit-message.txt"
+            status=changed
+          fi
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/preview)" ]; then
+            git push --quiet origin HEAD:preview
+          fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          { echo "### Request $REQUEST_ID: $status"; echo; cat "$work/summary.md"; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report back to SEED
+        if: always() && inputs.callback_url != ''
+        env:
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          STATUS: ${{ steps.finish.outputs.status }}
+          COMMIT: ${{ steps.finish.outputs.commit }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
+          WEBHOOK_SECRET: ${{ secrets.SEED_WEBHOOK_SECRET }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, hmac, json, os, urllib.request
+          work = os.path.join(os.environ["RUNNER_TEMP"], "seed")
+          try:
+              summary = open(os.path.join(work, "summary.md"), encoding="utf-8").read().strip()
+          except OSError:
+              summary = ""
+          status = os.environ.get("STATUS") or "failed"
+          if os.environ.get("JOB_STATUS") != "success":
+              status = "failed"
+          if status == "failed" and not summary:
+              summary = "The run failed before Claude finished. The run log has the details."
+          body = {
+              "request_id": os.environ.get("REQUEST_ID", ""),
+              "repository": os.environ.get("REPOSITORY", ""),
+              "status": status,
+              "summary": summary,
+              "commit": os.environ.get("COMMIT", ""),
+              "run_url": os.environ.get("RUN_URL", ""),
+              "branch": "preview",
+          }
+          data = json.dumps(body).encode("utf-8")
+          headers = {"Content-Type": "application/json"}
+          secret = os.environ.get("WEBHOOK_SECRET", "")
+          if secret:
+              headers["X-SEED-Signature"] = "sha256=" + hmac.new(secret.encode("utf-8"), data, hashlib.sha256).hexdigest()
+          request = urllib.request.Request(os.environ["CALLBACK_URL"], data=data, headers=headers, method="POST")
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  print("SEED answered", response.status)
+          except Exception as error:
+              print("::warning::Couldn't reach SEED:", error)
+          PY
