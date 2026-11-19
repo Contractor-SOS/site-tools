@@ -47,6 +47,9 @@ on:
         description: Long-lived token from `claude setup-token`; runs use that Claude subscription
         # Checked in the first step instead, so a missing secret fails with a readable message
         required: false
+      ANTHROPIC_API_KEY:
+        description: Anthropic API key (optional). When set, runs sign in with it and are billed to the API account; when not, they use CLAUDE_CODE_OAUTH_TOKEN
+        required: false
       SEED_WEBHOOK_SECRET:
         description: Shared secret SEED uses to check that a result really came from this workflow (optional)
         required: false
@@ -74,6 +77,7 @@ jobs:
       - name: Check the setup
         env:
           TOKEN_SET: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+          API_KEY_SET: ${{ secrets.ANTHROPIC_API_KEY != '' }}
         run: |
           # SEED's result address is private, and this log is public. It is read
           # from the run's event file (never from env, which the log prints) and
@@ -92,11 +96,18 @@ jobs:
               if len(token) >= 8:
                   print("::add-mask::" + token)
           PY
-          if [ "$TOKEN_SET" != "true" ]; then
-            echo "::error::This repo can't see the CLAUDE_CODE_OAUTH_TOKEN secret. In the organization's Settings, open Secrets and variables, then Actions, edit CLAUDE_CODE_OAUTH_TOKEN, and set Repository access to Public repositories."
+          # Either sign-in works: the API key wins when both are there. Only the
+          # kind of sign-in is ever written down, never any part of a value.
+          if [ "$API_KEY_SET" = "true" ]; then
+            signin="API key"
+          elif [ "$TOKEN_SET" = "true" ]; then
+            signin="plan token"
+          else
+            echo "::error::This repo can't see a Claude sign-in: neither the ANTHROPIC_API_KEY nor the CLAUDE_CODE_OAUTH_TOKEN secret is available. In the organization's Settings, open Secrets and variables, then Actions, edit the secret you use, set Repository access to Public repositories, and check that the site's caller workflow passes it on."
             exit 1
           fi
-          echo "Token secret is available."
+          echo "Claude signs in with the $signin."
+          echo "Claude sign-in for this run: $signin" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check out the preview branch
         uses: actions/checkout@v6
@@ -705,7 +716,10 @@ jobs:
         id: claude
         uses: anthropics/claude-code-action@v1
         with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Exactly one of these two is non-empty: the API key when it is set,
+          # otherwise the plan token
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.ANTHROPIC_API_KEY == '' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
           prompt: Read ${{ runner.temp }}/seed/prompt.md and follow the instructions in it.
           claude_args: >-
             --max-turns ${{ inputs.max_turns }}
