@@ -372,6 +372,23 @@ jobs:
             writeAtomic(MAP, JSON.stringify(map));
           }
 
+          // Turns %2D and the like back into characters, so an encoded reference counts.
+          function unpercent(text) {
+            return text.replace(/%([0-9A-Fa-f]{2})/g, (m, h) => String.fromCharCode(parseInt(h, 16)));
+          }
+
+          function siteText() {
+            let text = '';
+            for (const p of walk(SITE, TEXT, [])) {
+              try {
+                if (fs.statSync(p).size <= 5000000) text += fs.readFileSync(p, 'latin1') + '\n';
+              } catch (e) {
+                // unreadable: names nothing
+              }
+            }
+            return text;
+          }
+
           function walk(dir, test, out) {
             let entries = [];
             try {
@@ -752,14 +769,8 @@ jobs:
             }
             const asIs = new Set(downloaded.filter((p) => /\.(gif|svg|pdf)$/i.test(p)));
             const madePaths = new Set(map.paths);
-            let text = '';
-            for (const p of walk(SITE, TEXT, [])) {
-              try {
-                if (fs.statSync(p).size <= 5000000) text += fs.readFileSync(p, 'latin1') + '\n';
-              } catch (e) {
-                // unreadable: names nothing
-              }
-            }
+            const raw = siteText();
+            const text = raw + '\n' + unpercent(raw);
             let files = [];
             try {
               files = fs.readdirSync(UPLOADS, { withFileTypes: true }).filter((d) => d.isFile()).map((d) => path.join(UPLOADS, d.name));
@@ -784,6 +795,7 @@ jobs:
               }
               fs.rmSync(p);
               log('Removed ' + r + ' (no page names it)');
+              if (asIs.has(r)) note('The file ' + shown(name) + ' was not used on any page, so it was not added.');
             }
           }
 
@@ -800,6 +812,7 @@ jobs:
                 }
                 const len = buf.readUInt16BE(i + 2);
                 if (marker === 0xe1 && buf.toString('latin1', i + 4, i + 10) === 'Exif\0\0') return true;
+                if (marker === 0xe1 && buf.toString('latin1', i + 4, i + 33) === 'http://ns.adobe.com/xap/1.0/\0') return true;
                 i += 2 + len;
               }
               return false;
@@ -810,6 +823,7 @@ jobs:
                 const len = buf.readUInt32BE(i);
                 const type = buf.toString('latin1', i + 4, i + 8);
                 if (type === 'eXIf' || type === 'zxIf') return true;
+                if ((type === 'iTXt' || type === 'zTXt' || type === 'tEXt') && buf.toString('latin1', i + 8, i + 26) === 'XML:com.adobe.xmp\0') return true;
                 if (type === 'IEND') break;
                 i += 12 + len;
               }
@@ -820,21 +834,21 @@ jobs:
               while (i + 8 <= buf.length) {
                 const type = buf.toString('latin1', i, i + 4);
                 const len = buf.readUInt32LE(i + 4);
-                if (type === 'EXIF') return true;
+                if (type === 'EXIF' || type === 'XMP ') return true;
                 i += 8 + len + (len % 2);
               }
               return false;
             }
-            return buf.includes(Buffer.from('Exif\0\0', 'latin1'));
+            return buf.includes(Buffer.from('Exif\0\0', 'latin1')) || buf.includes(Buffer.from('ns.adobe.com/xap/1.0/', 'latin1'));
           }
 
           // The last check before the commit: a picture this run added or changed that
           // is over 1,000,000 bytes or still holds an EXIF block is taken out.
           function guard() {
             const before = readJson(path.join(TOOLS, 'before.json'), null);
-            if (!before) {
-              warn('No list of the pictures from before this run, so the last check was skipped');
-              return;
+            if (!before || typeof before !== 'object' || Array.isArray(before)) {
+              note('The pictures couldn\'t be checked before saving, so nothing was changed on the site this time. Send the request again.');
+              throw new Error('The list of pictures from before this run is missing, so nothing is committed');
             }
             for (const p of walk(SITE, RASTER, [])) {
               const r = rel(p);
@@ -845,7 +859,8 @@ jobs:
                 continue;
               }
               if (before[r] === sha(buf)) continue;
-              const heavy = buf.length > GUARD_BYTES;
+              // GIFs stay as they were sent (like SVG and PDF), so only their EXIF is checked.
+              const heavy = !/\.gif$/i.test(p) && buf.length > GUARD_BYTES;
               const exif = hasExif(buf);
               if (!heavy && !exif) continue;
               const why = heavy ? 'it is ' + kb(buf.length) + ', over the 1 MB a web picture may be' : 'it still held camera data such as location';
@@ -861,6 +876,19 @@ jobs:
               if (!restored) fs.rmSync(p, { force: true });
               warn('Taken out of the commit: ' + r);
               note('The picture ' + shown(path.basename(p)) + ' was left out of this change because ' + why + '. Check the page on the preview.');
+            }
+            // A page that points at a picture of this run's folder that isn't there
+            const id = (process.env.SAFE_ID || '').replace(/[^A-Za-z0-9_-]/g, '');
+            if (!id) return;
+            const seen = new Set();
+            const pattern = new RegExp('uploads/' + id + '/([A-Za-z0-9._%-]+)', 'g');
+            let m;
+            const text = siteText();
+            while ((m = pattern.exec(text)) !== null) {
+              const name = unpercent(m[1]).replace(/[.]+$/, '');
+              if (!name || seen.has(name)) continue;
+              seen.add(name);
+              if (name.includes('/') || !fs.existsSync(path.join(UPLOADS, name))) note('A page refers to the picture ' + shown(name) + ', which isn\'t there. Check the preview.');
             }
           }
 
