@@ -5,6 +5,7 @@ Shared GitHub Actions workflows for every website CSOS hosts. Each site repo car
 | Workflow | What it does | Called by |
 | --- | --- | --- |
 | `.github/workflows/claude-edit.yml` | Checks out the site's `preview` branch, has Claude Code make the requested change inside `site/`, commits it to `preview`, and reports the result to SEED | the site repo's `.github/workflows/claude-edit.yml` |
+| `.github/workflows/look-test.yml` | Pictures only: takes the look step's pictures of one site's home page (the same look.js as claude-edit.yml) and keeps them as a run artifact for 3 days. No Claude, no secrets | started by hand from the Actions tab |
 | `.github/workflows/archive-site.yml` | Takes full-page desktop and phone screenshots of an old website and copies listed files (logos, favicons), so nothing is lost before a move | the private `site-archive` repo |
 
 ## One-time setup for the organization
@@ -17,6 +18,7 @@ Shared GitHub Actions workflows for every website CSOS hosts. Each site repo car
 ## Setup for each site repo
 
 - A `preview` branch, made from `main`.
+- The repository must be **public**: the edit workflow keeps no credentials after its checkout (so Claude can't read the push token), and it fetches `main` without them. On a private repository that fetch fails and the run stops before Claude starts.
 
 ## Running an edit by hand
 
@@ -25,6 +27,8 @@ Site repo → **Actions → Claude edit → Run workflow**. Type the change in "
 ## What SEED sends and gets back
 
 SEED starts the site repo's `Claude edit` workflow with these inputs: `request_id`, `request`, `screenshots`, `attachments`, `history`, `callback_url`, `max_turns` and `model`. Screenshot and attachment URLs are separated by spaces, commas or new lines; an attachment URL can end in `#name=<file name>` (URL-encoded) to name the file it becomes.
+
+After Claude's edit, the workflow can take pictures of the changed pages (phone, tablet, laptop, desktop) with the runner's own Chrome, kept off the internet except for Google Fonts, and run a second Claude pass that looks at them and corrects the change (at most one more round to confirm). The input `look_mode` decides when: `auto` (the default: only when pictures, styles or layout changed), `always` or `never`. Today's callers pass nothing and get `auto`. A caller may declare `look_mode` as its own `workflow_dispatch` input; the shared workflow then reads it from the run's inputs even if the caller doesn't pass it on. Never send `look_mode` to a caller that doesn't declare it: GitHub refuses a run with an input the workflow doesn't have.
 
 When `callback_url` is set, the workflow POSTs this JSON to it when the run ends:
 
