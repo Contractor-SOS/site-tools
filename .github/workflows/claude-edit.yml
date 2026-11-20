@@ -146,17 +146,36 @@ jobs:
           # settings, and where HEAD points. Every later step that runs git sources
           # safe-git.sh, which puts the settings back and lets git run no program a
           # file under .git could name (hooks, fsmonitor, filters and diff drivers
-          # need settings; user and system settings are left out).
+          # need settings; user and system settings are left out). It also pins
+          # git to this repository's own .git folder, so no file under .git can
+          # send git to settings, objects or refs elsewhere.
           kept="$RUNNER_TEMP/git-before-claude"
           mkdir -p "$kept"
           cp .git/config "$kept/config"
+          pwd -P > "$kept/top"
           git rev-parse HEAD > "$kept/head-commit"
           git symbolic-ref HEAD > "$kept/head-ref"
           cat > "$kept/safe-git.sh" <<'SH'
           kept="$RUNNER_TEMP/git-before-claude"
-          cp "$kept/config" .git/config || exit 1
+          top=$(cat "$kept/top" 2> /dev/null || true)
+          safe_git_stop() {
+            line="Something in the site's own git folder changed during the run, so nothing was saved this time. Send the request again."
+            grep -qxF "$line" "$RUNNER_TEMP/seed-images/notes.md" 2> /dev/null || echo "$line" >> "$RUNNER_TEMP/seed-images/notes.md"
+            echo "::error::$1, so nothing is committed"
+            exit 1
+          }
+          # Only from the repository's top folder, and only with its own .git folder:
+          # no commondir, gitdir or alternates file may send git anywhere else
+          [ -n "$top" ] && [ "$(pwd -P)" = "$top" ] || safe_git_stop "Git was to run outside the repository's top folder"
+          [ -d "$top/.git" ] && [ ! -L "$top/.git" ] || safe_git_stop "The repository's .git is no longer a folder"
+          for f in commondir gitdir objects/info/alternates objects/info/http-alternates; do
+            [ ! -e "$top/.git/$f" ] && [ ! -L "$top/.git/$f" ] || safe_git_stop "A file .git/$f appeared during the run"
+          done
+          cp "$kept/config" "$top/.git/config" || safe_git_stop "Git's settings couldn't be put back"
+          unset GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_CONFIG_PARAMETERS GIT_CONFIG GIT_EXEC_PATH GIT_TEMPLATE_DIR GIT_SSH GIT_SSH_COMMAND GIT_ASKPASS SSH_ASKPASS GIT_EDITOR GIT_SEQUENCE_EDITOR GIT_PAGER GIT_EXTERNAL_DIFF GIT_PROXY_COMMAND GIT_TRACE GIT_TRACE_PACKET GIT_TRACE_PERFORMANCE GIT_TRACE_SETUP GIT_TRACE_CURL GIT_TRACE2 GIT_TRACE2_EVENT GIT_TRACE2_PERF GIT_CURL_VERBOSE GIT_REFLOG_ACTION GIT_CEILING_DIRECTORIES GIT_DISCOVERY_ACROSS_FILESYSTEM
+          export GIT_DIR="$top/.git" GIT_COMMON_DIR="$top/.git" GIT_WORK_TREE="$top"
           export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1
-          export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null GIT_CONFIG_KEY_1=core.fsmonitor GIT_CONFIG_VALUE_1=false
+          export GIT_CONFIG_COUNT=3 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null GIT_CONFIG_KEY_1=core.fsmonitor GIT_CONFIG_VALUE_1=false GIT_CONFIG_KEY_2=core.commitGraph GIT_CONFIG_VALUE_2=false
           SH
 
       - name: Save the request and download images
@@ -2223,9 +2242,10 @@ jobs:
           # and HEAD where it was then, so nothing under .git that Claude could have
           # written can run a program, see the token or change what is pushed
           . "$RUNNER_TEMP/git-before-claude/safe-git.sh"
-          safe=(-c core.fsmonitor=false -c core.hooksPath=/dev/null)
+          safe=(-c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.commitGraph=false)
           kept="$RUNNER_TEMP/git-before-claude"
           if [ "$(git "${safe[@]}" symbolic-ref HEAD)" != "$(cat "$kept/head-ref")" ] || [ "$(git "${safe[@]}" rev-parse HEAD)" != "$(cat "$kept/head-commit")" ]; then
+            echo "The site's saved history changed during the run, so nothing was saved this time. Send the request again." >> "$RUNNER_TEMP/seed-images/notes.md"
             echo "::error::The branch moved during the run, so nothing is committed"
             exit 1
           fi
@@ -2264,7 +2284,7 @@ jobs:
           if [ "$(git "${safe[@]}" rev-parse HEAD)" != "$(git "${safe[@]}" rev-parse origin/preview)" ]; then
             auth=$(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)
             echo "::add-mask::$auth"
-            GIT_CONFIG_COUNT=3 GIT_CONFIG_KEY_2="http.https://github.com/.extraheader" GIT_CONFIG_VALUE_2="AUTHORIZATION: basic $auth" \
+            GIT_CONFIG_COUNT=4 GIT_CONFIG_KEY_3="http.https://github.com/.extraheader" GIT_CONFIG_VALUE_3="AUTHORIZATION: basic $auth" \
               git "${safe[@]}" push --quiet origin HEAD:preview
           fi
           echo "status=$status" >> "$GITHUB_OUTPUT"
