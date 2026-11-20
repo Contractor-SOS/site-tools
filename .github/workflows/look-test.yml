@@ -1,0 +1,95 @@
+# Pictures only: proves that the look step of claude-edit.yml works on GitHub's
+# machine (the machine's own Chrome, playwright-core, the local server and the
+# fence around the browser) before a change to it reaches main. It takes the
+# pictures of one site's home page and keeps them as a run artifact for 3 days.
+# No Claude, no secrets, read-only.
+name: Look test (pictures only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: A site repository of ours, as owner/name
+        required: true
+        default: Contractor-SOS/cce-website
+      branch:
+        description: The branch to take pictures of
+        required: true
+        default: preview
+
+permissions:
+  contents: read
+
+jobs:
+  look:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check the inputs
+        env:
+          REPO_INPUT: ${{ inputs.repository }}
+          BRANCH_INPUT: ${{ inputs.branch }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          case "$REPO_INPUT" in
+            "$OWNER"/*) ;;
+            *) echo "::error::The repository must be one of $OWNER's"; exit 1 ;;
+          esac
+          if ! printf '%s' "$REPO_INPUT" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+            echo "::error::The repository must be written as owner/name"
+            exit 1
+          fi
+          if ! printf '%s' "$BRANCH_INPUT" | grep -Eq '^[A-Za-z0-9_./-]+$' || printf '%s' "$BRANCH_INPUT" | grep -q '\.\.'; then
+            echo "::error::The branch name has characters a branch can't have"
+            exit 1
+          fi
+
+      - name: Check out site-tools at this commit
+        uses: actions/checkout@v6
+        with:
+          path: tools
+          persist-credentials: false
+
+      - name: Check out the site
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.branch }}
+          path: target
+          persist-credentials: false
+
+      - name: Take the pictures
+        timeout-minutes: 4
+        run: |
+          set -euo pipefail
+          look="$RUNNER_TEMP/seed-look"
+          mkdir -p "$look"
+          # look.js lives in one place: the heredoc of the step "Take pictures of
+          # the changed pages" in claude-edit.yml. Take it from there, at this
+          # commit, exactly as bash would write it.
+          python3 - tools/.github/workflows/claude-edit.yml "$look/look.js" <<'PY'
+          import sys
+          lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+          start = next(i for i, l in enumerate(lines) if l.strip() == "cat > \"$look/look.js\" <<'LOOKJS'")
+          end = next(i for i in range(start + 1, len(lines)) if lines[i].strip() == "LOOKJS")
+          indent = len(lines[end]) - len(lines[end].lstrip(" "))
+          body = [l[indent:] if l.strip() else "" for l in lines[start + 1:end]]
+          open(sys.argv[2], "w", encoding="utf-8").write("\n".join(body) + "\n")
+          PY
+          node --check "$look/look.js"
+          printf '{"private": true}\n' > "$look/package.json"
+          # shellcheck disable=SC2046
+          (cd "$look" && timeout 60 npm install --ignore-scripts --no-audit --no-fund --no-save --loglevel=error $(node "$look/look.js" pins))
+          google-chrome --version || true
+          cd target
+          timeout -k 5 90 node "$look/look.js" shoot --site site --out "$RUNNER_TEMP/look-pictures" --pages index.html --tools "$look" --time-limit 85
+          cat "$RUNNER_TEMP/look-pictures/manifest.json"
+
+      - name: Keep the pictures for 3 days
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: look-pictures
+          path: ${{ runner.temp }}/look-pictures
+          retention-days: 3
+          if-no-files-found: warn
