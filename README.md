@@ -18,6 +18,7 @@ Shared GitHub Actions workflows for every website CSOS hosts. Each site repo car
 ## Setup for each site repo
 
 - A `preview` branch, made from `main`.
+- The repository must be **public**: the edit workflow keeps no credentials after its checkout (so Claude can't read the push token), and it fetches `main` without them. On a private repository that fetch fails and the run stops before Claude starts.
 
 ## Running an edit by hand
 

@@ -142,6 +142,22 @@ jobs:
           else
             git merge --no-edit -m "Bring preview up to date with the live site" origin/main
           fi
+          # Git as it is now, before Claude runs, kept outside Claude's reach: its
+          # settings, and where HEAD points. Every later step that runs git sources
+          # safe-git.sh, which puts the settings back and lets git run no program a
+          # file under .git could name (hooks, fsmonitor, filters and diff drivers
+          # need settings; user and system settings are left out).
+          kept="$RUNNER_TEMP/git-before-claude"
+          mkdir -p "$kept"
+          cp .git/config "$kept/config"
+          git rev-parse HEAD > "$kept/head-commit"
+          git symbolic-ref HEAD > "$kept/head-ref"
+          cat > "$kept/safe-git.sh" <<'SH'
+          kept="$RUNNER_TEMP/git-before-claude"
+          cp "$kept/config" .git/config || exit 1
+          export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1
+          export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null GIT_CONFIG_KEY_1=core.fsmonitor GIT_CONFIG_VALUE_1=false
+          SH
 
       - name: Save the request and download images
         env:
@@ -706,7 +722,19 @@ jobs:
               if (!st.isFile() || !was || !was.cut || was.original !== origPath) throw Object.assign(new Error('name taken'), { owner: 'a file named ' + shown(path.basename(dest)) + ' is already there' });
               prev = st.size <= 5000000 ? sha(fs.readFileSync(dest)) : '';
             }
-            const box = pixelBox(frac, orig);
+            let box = pixelBox(frac, orig);
+            // Clamped to the photo's own crop in pixels, so not one row or column
+            // outside that crop can reach a cut
+            const rule = map.plain && map.plain[origPath];
+            if (rule) {
+              const c = pixelBox(rule, orig);
+              const left = Math.max(box.left, c.left);
+              const top = Math.max(box.top, c.top);
+              const right = Math.min(box.left + box.width, c.left + c.width);
+              const bottom = Math.min(box.top + box.height, c.top + c.height);
+              if (right - left < 200 || bottom - top < 200) throw Object.assign(new Error('box too small inside the crop'), { owner: 'inside the crop of the photo, its box would be under the 200 pixels a side it needs' });
+              box = { left: left, top: top, width: right - left, height: bottom - top };
+            }
             const large = src.kind === 'large';
             const r = await render(buf, box, large ? LARGE : CONTENT, src.alpha);
             if (r.over && large) {
@@ -867,11 +895,27 @@ jobs:
               const frac = { left: e.left, top: e.top, width: e.width, height: e.height };
               plans.push({ e: e, name: name, out: out, origPath: origPath, orig: orig, dest: dest, frac: frac, applied: JSON.stringify([e.path, e.left, e.top, e.width, e.height, e.save_as || '']) });
             }
+            // LOOK_ROUND is set when the crops come from a look at the pictures. A look
+            // may only narrow: its crop of a photo is kept inside the crop the first
+            // pass made of it. A new run (a new request) starts afresh.
+            const lookRound = /^[12]$/.test(process.env.LOOK_ROUND || '');
+            map.firstPlain = map.firstPlain || {};
             for (const plan of plans.filter((x) => !x.dest)) {
-              const { name, origPath, orig, frac } = plan;
+              const { name, origPath, orig } = plan;
+              let frac = plan.frac;
               if (map.applied.includes(plan.applied)) {
                 log('Already cut earlier in this run: ' + name);
                 continue;
+              }
+              const first = map.firstPlain[origPath];
+              if (lookRound && first && !inside(frac, first)) {
+                const both = overlap(frac, first);
+                if (!both) {
+                  refuse(name, 'its box lies wholly outside the first crop of the photo ' + shown(orig.name) + ', and a later crop may only make it smaller');
+                  continue;
+                }
+                frac = both;
+                note('The later crop of the photo ' + shown(orig.name) + ' reached outside its first crop, so only the part inside the first crop was kept: nothing the first crop left out came back.');
               }
               try {
                 const buf = readOriginal(origPath, orig);
@@ -898,6 +942,7 @@ jobs:
                   log('Cropped ' + rel(r.target.path) + ' from ' + orig.name + ': box ' + box.width + ' x ' + box.height + ' at ' + box.left + ',' + box.top + '; now ' + r.width + ' x ' + r.height + ' pixels, ' + r.data.length + ' bytes');
                 }
                 map.plain[origPath] = frac;
+                if (!lookRound) map.firstPlain[origPath] = frac;
                 map.applied.push(plan.applied);
                 saveMap(map);
               } catch (err) {
@@ -1114,6 +1159,8 @@ jobs:
           # the step did (keep_inside on an error, guard on a missing list).
           cat > "$tools/checks.sh" <<'SH'
           tools="$RUNNER_TEMP/seed-images"
+          # Git with its settings from before Claude ran, and no hooks
+          . "$RUNNER_TEMP/git-before-claude/safe-git.sh"
           case "${1:-}" in
             keep_inside)
               set -euo pipefail
@@ -1231,10 +1278,12 @@ jobs:
               echo "  Your eye for coordinates is approximate, so leave a clear margin around what must go. After you finish, the workflow cuts that box from the original and remakes the picture (and its -large copy) under the same path, so set the picture's width and height in the page to the box's shape: box width x original width by box height x original height (only the ratio matters)."
               echo "  In your summary, say what you cut out, so the owner checks it on the preview."
               echo "- A full-width background photo: at most one per page, with a background-color behind it that suits the photo while it loads. It gets two cuts from the original: a wide cut for screens wider than tall and a tall cut for phones, chosen in the stylesheet with @media (orientation: landscape) and (orientation: portrait) or an aspect-ratio query. Make both with save_as from the -large copy (the normal copy if there is none); when the whole photo already suits one of the two shapes, use the -large copy itself for that one. Each cut is made at most 2,400 pixels and 600 KB. In your summary, say which part of the photo each cut keeps."
-              echo "- The still-background effect (the page slides over a photo that stays put): never use background-attachment: fixed, which iPhones don't hold still. Put the photo on a layer with position: fixed behind the content; for one page-wide backdrop, a ::before with position: fixed; inset: 0; z-index: -1 and the photo as its background (background-size: cover). Make sure text over the photo stays readable, with a dark overlay or a solid panel behind the text."
-              echo "- Fixed photo background: when a page gets a fixed background photo, that page's header and footer are fully see-through over the photo, with no tint of their own (the photo's own dimming keeps their text readable; check the contrast). The menu bar is see-through only while the page is at its top and becomes solid once the page has scrolled, so page text never runs through the menu: add a few lines to the site's one script that set a class on the bar when the page has scrolled, written so that without JavaScript the bar stays solid (the see-through look applies only while a class the script sets is present)."
-              echo "- Where a page has a fixed background layer and its menu bar stays solid at the top, a phone that bounces at the top of the page shows that layer above the header for a moment. Give such a header a block of its own colour above itself (a pseudo-element on the sticky header: position absolute, bottom 100%, height 100vh, the header's background, pointer-events none) so the gap shows the header's colour. With a see-through bar at the top, don't add that block. Do not do the same below the footer: a block below the page's end makes the page longer. Do not switch off the bounce (no overscroll-behavior: none)."
             fi
+            echo
+            echo "If the request gives a page a photo that stays put behind it (a photo the owner sent or one the site already has):"
+            echo "- The still-background effect (the page slides over a photo that stays put): never use background-attachment: fixed, which iPhones don't hold still. Put the photo on a layer with position: fixed behind the content; for one page-wide backdrop, a ::before with position: fixed; inset: 0; z-index: -1 and the photo as its background (background-size: cover). Make sure text over the photo stays readable, with a dark overlay or a solid panel behind the text."
+            echo "- Fixed photo background: when a page gets a fixed background photo, that page's header and footer are fully see-through over the photo, with no tint of their own (the photo's own dimming keeps their text readable; check the contrast). The menu bar is see-through only while the page is at its top, so page text never runs through the menu: the site's one script adds a class to the menu bar while the page is at its top and removes it once the page has scrolled, and the see-through look is written only for that class, so without JavaScript the bar is solid."
+            echo "- Where a page has a fixed background layer and its menu bar stays solid at the top, a phone that bounces at the top of the page shows that layer above the header for a moment. Give such a header a block of its own colour above itself (a pseudo-element on the sticky header: position absolute, bottom 100%, height 100vh, the header's background, pointer-events none) so the gap shows the header's colour. With a see-through bar at the top, don't add that block. Do not do the same below the footer: a block below the page's end makes the page longer. Do not switch off the bounce (no overscroll-behavior: none)."
             if [ -s "$work/attachment-notes.md" ]; then
               echo
               echo "Some files the owner sent had problems. $work/attachment-notes.md lists them, one sentence each. Copy each of those sentences into your summary exactly as it is written."
@@ -1335,6 +1384,7 @@ jobs:
           ];
           const SLICE = { width: 1366, height: 1568, most: 3 };
           const LONG_EDGE = 1568;
+          const NO_UDP_APIS = '(() => { for (const k of ["RTCPeerConnection", "webkitRTCPeerConnection", "RTCDataChannel", "WebTransport"]) { try { Object.defineProperty(globalThis, k, { value: undefined, writable: false, configurable: false }); } catch (e) { try { delete globalThis[k]; } catch (e2) {} } } })();';
           const MOST_PAGES = 2;
           const WAIT_MS = 5000;
           const PAGE = /\.html?$/i;
@@ -1680,7 +1730,7 @@ jobs:
                 '--proxy-server=http://127.0.0.1:' + wall.address().port,
                 '--proxy-bypass-list=<-loopback>;127.0.0.1:' + port,
                 '--disable-blink-features=SharedWorker',
-                '--force-webrtc-ip-handling-policy=disable_non_proxied_udp', '--disable-background-networking', '--no-first-run', '--disable-extensions'],
+                '--webrtc-ip-handling-policy=disable_non_proxied_udp', '--disable-background-networking', '--no-first-run', '--disable-extensions'],
             });
             const manifest = {
               about: 'Pictures of the changed pages, taken with headless Chrome from the site folder served on this machine. Only the site itself and Google Fonts could load: embedded forms, maps, calendars and anything else from another site show as empty boxes. Each picture was scaled so its long edge is at most ' + LONG_EDGE + ' pixels; scale is picture pixels per screen pixel.',
@@ -1725,6 +1775,10 @@ jobs:
                     return route.abort('blockedbyclient');
                   });
                   await context.routeWebSocket(() => true, (ws) => ws.close({ code: 1008, reason: 'blocked' }));
+                  // WebRTC and WebTransport speak UDP, which neither the route nor the wall
+                  // sees; a page being photographed needs neither. Gone before any page
+                  // script runs, in every page and frame.
+                  await context.addInitScript(NO_UDP_APIS);
                   const page = await context.newPage();
                   context.on('page', (p) => {
                     if (p !== page) p.close().catch(() => {});
@@ -1811,6 +1865,8 @@ jobs:
           #             again, and say whether it changed anything
           #   finish    put "What I checked" from the last look pass into the summary
           set -uo pipefail
+          # Git with its settings from before Claude ran, and no hooks
+          . "$RUNNER_TEMP/git-before-claude/safe-git.sh"
           look="$RUNNER_TEMP/seed-look"
           work="$RUNNER_TEMP/seed"
           tools="$RUNNER_TEMP/seed-images"
@@ -1895,7 +1951,7 @@ jobs:
               fi
               echo "- A full-width background photo gets two cuts from the original: a wide cut for screens wider than tall and a tall cut for phones, chosen in the stylesheet with @media (orientation: landscape) and (orientation: portrait) or an aspect-ratio query. Make both with save_as from the -large copy (the normal copy if there is none); when the whole photo already suits one of the two shapes, use the -large copy itself for that one. Each cut is made at most 2,400 pixels and 600 KB. What the owner asked to keep out of a photo (a house number, a face) must be out of EVERY cut: a separate cut whose box reaches outside the photo's own crop is refused, and an earlier cut that does is cut again inside it or removed."
               echo "- The still-background effect: never use background-attachment: fixed, which iPhones don't hold still. Keep the photo on a layer with position: fixed behind the content (a ::before with position: fixed; inset: 0; z-index: -1 and the photo as its background, background-size: cover). Keep text over the photo readable, with a dark overlay or a solid panel behind it."
-              echo "- Fixed photo background: when a page gets a fixed background photo, that page's header and footer are fully see-through over the photo, with no tint of their own (the photo's own dimming keeps their text readable; check the contrast). The menu bar is see-through only while the page is at its top and becomes solid once the page has scrolled, so page text never runs through the menu: a few lines in the site's one script set a class on the bar when the page has scrolled, written so that without JavaScript the bar stays solid (the see-through look applies only while a class the script sets is present). Check the bar in the top pictures (see-through and readable over the photo) and in the one-screen-down pictures (solid)."
+              echo "- Fixed photo background: when a page gets a fixed background photo, that page's header and footer are fully see-through over the photo, with no tint of their own (the photo's own dimming keeps their text readable; check the contrast). The menu bar is see-through only while the page is at its top, so page text never runs through the menu: the site's one script adds a class to the menu bar while the page is at its top and removes it once the page has scrolled, and the see-through look is written only for that class, so without JavaScript the bar is solid. Check the bar in the top pictures (see-through and readable over the photo) and in the one-screen-down pictures (solid)."
               echo "- Where a page has a fixed background layer and its menu bar stays solid at the top, a phone that bounces at the top of the page shows that layer above the header for a moment. Give such a header a block of its own colour above itself (a pseudo-element on the sticky header: position absolute, bottom 100%, height 100vh, the header's background, pointer-events none) so the gap shows the header's colour. With a see-through bar at the top, don't add that block. Do not do the same below the footer: a block below the page's end makes the page longer. Do not switch off the bounce (no overscroll-behavior: none). No picture can show this bounce, so you can't judge it here: check in the stylesheet that the block is there where it belongs."
               echo
               echo "When you finish, write \"What I checked\" for the owner to $pics/checked.md: one line for each screen size (phone, tablet, laptop, desktop) saying what you checked and what you changed because of it, in plain words, no code and no file paths. If you made separate cuts, say which part of the photo each one keeps. Don't change $work/summary.md."
@@ -1970,7 +2026,7 @@ jobs:
                   # they were before this look, to undo a look that doesn't finish
                   cp "$work/summary.md" "$look/summary-before-$round.md" 2> /dev/null || : > "$look/summary-before-$round.md"
                   rm -f "$look/site-before-$round.tar" "$look/crops-before-$round.json"
-                  if tar -cf "$look/site-before-$round.tar" site && { [ ! -e "$work/crops.json" ] || cp "$work/crops.json" "$look/crops-before-$round.json"; }; then
+                  if tar -cf "$look/site-before-$round.tar" site && site_list . > "$look/site-before-$round.sum" && [ -s "$look/site-before-$round.sum" ] && { [ ! -e "$work/crops.json" ] || cp "$work/crops.json" "$look/crops-before-$round.json"; }; then
                     fingerprint > "$look/fingerprint-$round"
                     look_out=yes
                   else
@@ -1985,6 +2041,15 @@ jobs:
             echo "look=$look_out" >> "$GITHUB_OUTPUT"
           }
 
+          # The list a copy of site/ is checked against: sha256 of every file, every
+          # symbolic link with its target, every folder, each part sorted.
+          site_list() {
+            ( cd "$1" &&
+              find site -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum -- &&
+              find site -type l -printf '%p -> %l\n' | LC_ALL=C sort &&
+              find site -type d | LC_ALL=C sort )
+          }
+
           # Puts site/ and the crop list back as they were before look pass N. The copy
           # is unpacked into a folder of its own and counted first; site/ is replaced only
           # once that copy is complete. Any failure returns 1, and the caller fails the job.
@@ -1995,10 +2060,11 @@ jobs:
             rm -rf "$restore" && mkdir -p "$restore" || return 1
             tar -xf "$tarball" -C "$restore" || return 1
             [ -d "$restore/site" ] || return 1
-            local listed found
-            listed=$(tar -tf "$tarball" | sed 's#/$##' | sort -u | wc -l) || return 1
-            found=$(cd "$restore" && find site | wc -l) || return 1
-            [ "$listed" -gt 0 ] && [ "$listed" = "$found" ] || return 1
+            # The unpacked copy must match, byte for byte, the list made when the copy
+            # was taken: every file's sha256, every link with its target, every folder.
+            [ -s "$look/site-before-$round.sum" ] || return 1
+            site_list "$restore" > "$look/restore-$round.sum" || return 1
+            cmp -s "$look/site-before-$round.sum" "$look/restore-$round.sum" || return 1
             rm -rf site || return 1
             mv "$restore/site" site || return 1
             rm -f "$work/crops.json" || return 1
@@ -2040,7 +2106,7 @@ jobs:
             echo "changed=$changed" >> "$GITHUB_OUTPUT"
             # The same checks as after the first pass, so they run after the last one
             bash "$tools/checks.sh" keep_inside || exit 1
-            bash "$tools/checks.sh" crop
+            LOOK_ROUND="$round" bash "$tools/checks.sh" crop
             bash "$tools/checks.sh" cleanup
             bash "$tools/checks.sh" guard || exit 1
           }
@@ -2153,6 +2219,18 @@ jobs:
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/seed"
+          # Git's settings as they were before Claude ran, no hooks or fsmonitor,
+          # and HEAD where it was then, so nothing under .git that Claude could have
+          # written can run a program, see the token or change what is pushed
+          . "$RUNNER_TEMP/git-before-claude/safe-git.sh"
+          safe=(-c core.fsmonitor=false -c core.hooksPath=/dev/null)
+          kept="$RUNNER_TEMP/git-before-claude"
+          if [ "$(git "${safe[@]}" symbolic-ref HEAD)" != "$(cat "$kept/head-ref")" ] || [ "$(git "${safe[@]}" rev-parse HEAD)" != "$(cat "$kept/head-commit")" ]; then
+            echo "::error::The branch moved during the run, so nothing is committed"
+            exit 1
+          fi
+          # The index from HEAD, so only site/ as it is now can be committed
+          git "${safe[@]}" read-tree HEAD
           [ -s "$work/summary.md" ] || echo "Claude finished without writing a summary." > "$work/summary.md"
           # Problems with the files the owner sent (some known only after Claude
           # ran) go into the summary, unless Claude already repeated them word for word
@@ -2167,9 +2245,9 @@ jobs:
           if missing:
               open(sys.argv[1], "w", encoding="utf-8").write(summary + "\n\n" + "\n".join(missing) + "\n")
           PY
-          git add -A site
+          git "${safe[@]}" add -A site
           status=no_changes
-          if ! git diff --cached --quiet; then
+          if ! git "${safe[@]}" diff --cached --quiet; then
             title=$(python3 - "$work/summary.md" <<'PY'
           import re, sys
           text = " ".join(open(sys.argv[1], encoding="utf-8").read().split())
@@ -2180,17 +2258,17 @@ jobs:
           PY
             )
             { printf '%s\n\n' "$title"; cat "$work/summary.md"; printf '\nSEED-Request: %s\n' "$REQUEST_ID"; } > "$work/commit-message.txt"
-            git commit --quiet --file "$work/commit-message.txt"
+            git "${safe[@]}" commit --quiet --file "$work/commit-message.txt"
             status=changed
           fi
-          if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/preview)" ]; then
+          if [ "$(git "${safe[@]}" rev-parse HEAD)" != "$(git "${safe[@]}" rev-parse origin/preview)" ]; then
             auth=$(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)
             echo "::add-mask::$auth"
-            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
-              git push --quiet origin HEAD:preview
+            GIT_CONFIG_COUNT=3 GIT_CONFIG_KEY_2="http.https://github.com/.extraheader" GIT_CONFIG_VALUE_2="AUTHORIZATION: basic $auth" \
+              git "${safe[@]}" push --quiet origin HEAD:preview
           fi
           echo "status=$status" >> "$GITHUB_OUTPUT"
-          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git "${safe[@]}" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           { echo "### Request $REQUEST_ID: $status"; echo; cat "$work/summary.md"; } >> "$GITHUB_STEP_SUMMARY"
           # The summary also goes on the run as a note, so SEED can read it from
           # GitHub even when the result never reaches SEED's webhook.
